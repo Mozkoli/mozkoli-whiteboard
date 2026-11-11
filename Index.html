@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mozkoli Whiteboard Pro</title>
+    <style>
+        body { background-color: #0a0a0f; color: #e5e5e5; font-family: system-ui, sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        h1 { color: #D4AF37; font-size: 24px; margin-bottom: 5px; }
+        p { color: #888; font-size: 14px; text-align: center; margin-bottom: 20px; }
+        textarea { width: 100%; max-width: 600px; height: 100px; background: #121218; border: 1px solid #27272a; color: #fff; padding: 15px; border-radius: 8px; font-size: 16px; margin-bottom: 15px; resize: vertical; }
+        button { width: 100%; max-width: 600px; padding: 15px; background: #D4AF37; color: #000; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #status { margin-top: 15px; color: #D4AF37; font-weight: bold; text-align: center; min-height: 20px;}
+        #canvas-container { position: relative; margin-top: 20px; width: 100%; max-width: 600px; aspect-ratio: 4/3; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        canvas { width: 100%; height: 100%; display: block; }
+        .controls { display: flex; gap: 10px; margin-top: 15px; width: 100%; max-width: 600px; }
+        .controls button { flex: 1; background: #4F46E5; color: white; }
+        .controls button.record { background: #DC2626; }
+    </style>
+</head>
+<body>
+    <h1>Mozkoli Whiteboard</h1>
+    <p>Type your script. The AI will draw it and speak it.</p>
+    <textarea id="scriptInput">When you hear the word Mermaid, you think of a fairy tale. But in Africa, the water spirit is a god. She is beautiful, she is wealthy, and she is dangerous.</textarea>
+    <button id="startBtn" onclick="startAnimation()">Generate & Animate</button>
+    <div id="status">Ready</div>
+    <div id="canvas-container"><canvas id="whiteboard" width="800" height="600"></canvas></div>
+    <div class="controls">
+        <button id="recordBtn" class="record" onclick="toggleRecording()">Start Recording</button>
+        <button onclick="downloadVideo()">Download Video</button>
+    </div>
+
+<script>
+    const canvas = document.getElementById('whiteboard');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    
+    let scenes = [];
+    let isRecording = false;
+    let mediaRecorder;
+    let recordedChunks = [];
+
+    // FIX 1: Robust Script Parsing
+    function parseScript(text) {
+        return text.match(/[^.!?]+(?:[.!?]+|$)/g)
+            ?.map(sentence => sentence.trim())
+            .filter(Boolean) ?? [];
+    }
+
+    async function fetchSketch(prompt) {
+        const encoded = encodeURIComponent(prompt + ", simple black and white line art sketch on a white background, whiteboard style, minimalist");
+        const url = `https://image.pollinations.ai/prompt/${encoded}?width=800&height=600&nologo=true`;
+        const img = new Image();
+        img.crossOrigin = "Anonymous";
+        return new Promise((resolve, reject) => {
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = url;
+        });
+    }
+
+    // FIX 2: Handle Speech Errors and Voice Loading
+    function speak(text) {
+        return new Promise((resolve) => {
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 0.9;
+            
+            const voices = window.speechSynthesis.getVoices();
+            const deepVoice = voices.find(v => v.name.includes('Male') || v.name.includes('UK'));
+            if (deepVoice) utterance.voice = deepVoice;
+
+            // Fix: Resolve on error too, so Promise.all() doesn't hang
+            utterance.onend = resolve;
+            utterance.onerror = (e) => { console.warn("Speech error", e); resolve(); };
+            
+            window.speechSynthesis.speak(utterance);
+        });
+    }
+
+    function animateDrawing(img, duration) {
+        return new Promise((resolve) => {
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            let startTime = null;
+            const drawSpeed = duration * 1000;
+            const maxRadius = 900; 
+
+            function draw(now) {
+                if (!startTime) startTime = now;
+                const elapsed = now - startTime;
+                const progress = Math.min(elapsed / drawSpeed, 1);
+                const revealRadius = progress * maxRadius;
+
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.save();
+                ctx.beginPath();
+                for(let angle = 0; angle < Math.PI * 2; angle += 0.1) {
+                    const r = revealRadius + (Math.sin(angle * 10) * 20);
+                    const x = canvas.width/2 + Math.cos(angle) * r;
+                    const y = canvas.height/2 + Math.sin(angle) * r;
+                    if(angle === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.closePath();
+                ctx.clip();
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                
+                if (progress < 1) {
+                    ctx.beginPath();
+                    ctx.arc(canvas.width/2 + revealRadius, canvas.height/2, 8, 0, Math.PI * 2);
+                    ctx.fillStyle = '#333';
+                    ctx.fill();
+                    requestAnimationFrame(draw);
+                } else {
+                    ctx.restore();
+                    resolve();
+                }
+            }
+            requestAnimationFrame(draw);
+        });
+    }
+
+    // FIX 4: Track Failures and Prevent False "Complete" Status
+    async function startAnimation() {
+        const text = document.getElementById('scriptInput').value.trim();
+        scenes = parseScript(text);
+
+        if (scenes.length === 0) return alert("Please enter a valid script.");
+
+        startBtn.disabled = true;
+        let hasFailed = false;
+        
+        for (let i = 0; i < scenes.length; i++) {
+            const sentence = scenes[i];
+            status.innerText = `Generating scene ${i+1} of ${scenes.length}...`;
+            
+            try {
+                const img = await fetchSketch(sentence);
+                status.innerText = `Drawing scene ${i+1}...`;
+                
+                const wordCount = sentence.split(' ').length;
+                const estDuration = Math.max(wordCount / 2.5, 3); 
+
+                await Promise.all([
+                    speak(sentence),
+                    animateDrawing(img, estDuration)
+                ]);
+                
+                await new Promise(r => setTimeout(r, 1000));
+            } catch (e) {
+                console.error(e);
+                hasFailed = true;
+                status.innerText = `Error on scene ${i+1}. Skipping...`;
+            }
+        }
+
+        if (hasFailed) {
+            status.innerText = "Finished, but some scenes failed to load.";
+        } else {
+            status.innerText = "Video Complete!";
+        }
+        startBtn.disabled = false;
+    }
+
+    // FIX 3: Robust MediaRecorder
+    function toggleRecording() {
+        if (isRecording) {
+            mediaRecorder.stop();
+            isRecording = false;
+            document.getElementById('recordBtn').innerText = "Start Recording";
+            document.getElementById('recordBtn').style.background = "#DC2626";
+            return;
+        }
+
+        if (!canvas.captureStream || !window.MediaRecorder) {
+            return alert("Canvas recording is not supported in this browser.");
+        }
+
+        const mimeType = ["video/webm;codecs=vp9", "video/webm"]
+            .find(type => MediaRecorder.isTypeSupported(type));
+
+        if (!mimeType) return alert("This browser does not support WebM recording.");
+
+        recordedChunks = [];
+        const stream = canvas.captureStream(30);
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) recordedChunks.push(event.data);
+        };
+
+        mediaRecorder.start();
+        isRecording = true;
+        document.getElementById('recordBtn').innerText = "Stop Recording";
+        document.getElementById('recordBtn').style.background = "#000";
+        status.innerText = "Recording started. Click Generate.";
+    }
+
+    function downloadVideo() {
+        if (recordedChunks.length === 0) return alert("No video recorded yet.");
+        const blob = new Blob(recordedChunks, { type: "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        document.body.appendChild(a);
+        a.style = "display: none";
+        a.href = url;
+        a.download = "mozkoli_whiteboard.webm";
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }
+</script>
+</body>
+</html>
