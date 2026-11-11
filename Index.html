@@ -12,6 +12,7 @@
         button { width: 100%; max-width: 600px; padding: 15px; background: #D4AF37; color: #000; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.3s; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         #status { margin-top: 15px; color: #D4AF37; font-weight: bold; text-align: center; min-height: 20px; }
+        #warning { color: #f87171; font-size: 12px; text-align: center; max-width: 600px; margin-bottom: 10px; }
         #canvas-container { position: relative; margin-top: 20px; width: 100%; max-width: 600px; aspect-ratio: 4/3; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4); }
         canvas { width: 100%; height: 100%; display: block; }
         .controls { display: flex; gap: 10px; margin-top: 15px; width: 100%; max-width: 600px; }
@@ -22,6 +23,7 @@
 <body>
     <h1>Mozkoli Whiteboard</h1>
     <p>Type your script. The AI will handwrite it, draw it, and speak it.</p>
+    <div id="warning">⚠️ Note: Browsers cannot record AI voice. Use your phone's screen recorder for the final video.</div>
     <textarea id="scriptInput">When you hear the word Mermaid, you think of a fairy tale. But in Africa, the water spirit is a god. She is beautiful, she is wealthy, and she is dangerous.</textarea>
     <button id="startBtn" onclick="startAnimation()">Generate &amp; Animate</button>
     <div id="status">Ready</div>
@@ -39,26 +41,28 @@
     const recordBtn = document.getElementById('recordBtn');
     const handwritingFont = 'italic 38px "Brush Script MT", "Segoe Script", cursive';
 
-    let scenes = [];
+    let isProcessing = false;
     let isRecording = false;
     let mediaRecorder;
     let recordedChunks = [];
     let recordingStream;
 
+    // AGENT FIX: Robust sentence parsing
     function parseScript(text) {
-        return text.match(/[^.!?]+(?:[.!?]+|$)/g)
-            ?.map(sentence => sentence.trim())
-            .filter(Boolean) ?? [];
+        return text.match(/[^.!?]+(?:[.!?]+|$)/g)?.map(s => s.trim()).filter(Boolean) ?? [];
     }
 
+    // AGENT FIX: Copilot's Flux API integration
     async function fetchSketch(prompt) {
-        const encoded = encodeURIComponent(prompt + ", simple black and white line art sketch on a white background, whiteboard style, minimalist");
-        const url = `https://image.pollinations.ai/prompt/${encoded}?width=800&height=600&nologo=true`;
+        const enhancedPrompt = prompt + ", clean black and white sketch, detailed line art, coloring book style, white background, high quality";
+        const encoded = encodeURIComponent(enhancedPrompt);
+        const url = `https://image.pollinations.ai/prompt/${encoded}?width=800&height=600&model=flux&nologo=true&enhance=true`;
+        
         const img = new Image();
         img.crossOrigin = "Anonymous";
         return new Promise((resolve, reject) => {
             img.onload = () => resolve(img);
-            img.onerror = reject;
+            img.onerror = () => reject(new Error(`Failed to load sketch for: ${prompt}`));
             img.src = url;
         });
     }
@@ -68,10 +72,8 @@
             window.speechSynthesis.cancel();
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.rate = 0.9;
-            const voice = window.speechSynthesis.getVoices().find(v => /Male|UK/i.test(v.name));
-            if (voice) utterance.voice = voice;
             utterance.onend = resolve;
-            utterance.onerror = event => { console.warn("Speech error", event); resolve(); };
+            utterance.onerror = resolve;
             window.speechSynthesis.speak(utterance);
         });
     }
@@ -87,33 +89,17 @@
         let line = 0;
 
         for (const char of text) {
-            if (char === '\n') {
-                x = left;
-                y += lineHeight;
-                line++;
-                continue;
-            }
+            if (char === '\n') { x = left; y += lineHeight; line++; continue; }
             const width = ctx.measureText(char).width;
-            if (x + width > maxX && x > left) {
-                x = left;
-                y += lineHeight;
-                line++;
-            }
-            // Tiny per-letter variations help the fallback cursive font feel less mechanically placed.
+            if (x + width > maxX && x > left) { x = left; y += lineHeight; line++; }
             const seed = chars.length;
             chars.push({
-                char,
-                x,
-                y: y + Math.sin(seed * 1.7) * 1.4,
-                width,
-                rotation: Math.sin(seed * 2.3) * 0.025,
-                line
+                char, x, y: y + Math.sin(seed * 1.7) * 1.4, width,
+                rotation: Math.sin(seed * 2.3) * 0.025, line
             });
             x += width + (char === ' ' ? 1 : Math.sin(seed * 2.1) * 0.55);
         }
-
-        const lineCount = line + 1;
-        const offset = (canvas.height - lineCount * lineHeight) / 2 + 25 - canvas.height / 2;
+        const offset = (canvas.height - (line + 1) * lineHeight) / 2 + 25 - canvas.height / 2;
         chars.forEach(item => { item.y += offset; });
         return chars;
     }
@@ -135,16 +121,7 @@
         ctx.translate(x, y);
         ctx.rotate(angle);
         ctx.fillStyle = '#e11d48';
-        ctx.beginPath();
-        ctx.moveTo(-5, -4);
-        ctx.lineTo(13, 0);
-        ctx.lineTo(-5, 4);
-        ctx.closePath();
-        ctx.fill();
-        ctx.fillStyle = '#7f1d1d';
-        ctx.beginPath();
-        ctx.arc(11, 0, 2, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.beginPath(); ctx.moveTo(-5, -4); ctx.lineTo(13, 0); ctx.lineTo(-5, 4); ctx.closePath(); ctx.fill();
         ctx.restore();
     }
 
@@ -152,34 +129,28 @@
         return new Promise(resolve => {
             const chars = layoutHandwriting(text);
             const weights = chars.map(item => {
-                const punctuationPause = /[,;:]/.test(item.char) ? 2.2 : /[.!?]/.test(item.char) ? 3.8 : 1;
-                return (0.65 + Math.min(item.width / 22, 1.15)) * punctuationPause;
+                const pause = /[,;:]/.test(item.char) ? 2.2 : /[.!?]/.test(item.char) ? 3.8 : 1;
+                return (0.65 + Math.min(item.width / 22, 1.15)) * pause;
             });
-            const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+            const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
             const start = performance.now();
-            let elapsedWeight = 0;
-            const intervals = weights.map(weight => {
-                const interval = [elapsedWeight / totalWeight, (elapsedWeight + weight) / totalWeight];
-                elapsedWeight += weight;
-                return interval;
+            let elapsed = 0;
+            const intervals = weights.map(w => {
+                const interval = [elapsed / totalWeight, (elapsed + w) / totalWeight];
+                elapsed += w; return interval;
             });
 
             function frame(now) {
                 const progress = Math.min((now - start) / (duration * 1000), 1);
-                ctx.fillStyle = '#fff';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.font = handwritingFont;
-                ctx.textBaseline = 'alphabetic';
-                ctx.fillStyle = '#171717';
+                ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.font = handwritingFont; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = '#171717';
+                let active = null, activeReveal = 0;
 
-                let active = null;
-                let activeReveal = 0;
-                chars.forEach((item, index) => {
-                    const [from, to] = intervals[index];
+                chars.forEach((item, i) => {
+                    const [from, to] = intervals[i];
                     if (progress >= to) drawGlyph(item);
                     else if (progress >= from) {
-                        active = item;
-                        activeReveal = Math.min((progress - from) / (to - from), 1);
+                        active = item; activeReveal = Math.min((progress - from) / (to - from), 1);
                         drawGlyph(item, activeReveal);
                     }
                 });
@@ -192,48 +163,30 @@
         });
     }
 
-    // A broad moving eraser clears the written line, with a soft edge and a visible eraser block.
-    function eraseHandwriting(text, duration = 1100) {
+    function eraseHandwriting(text, duration = 800) {
         return new Promise(resolve => {
             const chars = layoutHandwriting(text);
             const start = performance.now();
-
             function frame(now) {
                 const progress = Math.min((now - start) / duration, 1);
                 const eraseX = -40 + (canvas.width + 80) * progress;
-                ctx.fillStyle = '#fff';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.font = handwritingFont;
-                ctx.textBaseline = 'alphabetic';
-                ctx.fillStyle = '#171717';
+                ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.font = handwritingFont; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = '#171717';
                 chars.forEach(item => drawGlyph(item));
-
-                // Wipe only the portion already passed by the eraser.
                 ctx.clearRect(0, 0, Math.max(0, eraseX), canvas.height);
-                ctx.fillStyle = 'rgba(255,255,255,0.96)';
-                ctx.fillRect(eraseX - 18, 0, 36, canvas.height);
-                ctx.fillStyle = '#ef4444';
-                ctx.fillRect(eraseX - 4, 0, 8, canvas.height);
-                ctx.fillStyle = 'rgba(210,210,210,0.45)';
-                ctx.fillRect(eraseX + 5, 0, 3, canvas.height);
-
+                ctx.fillStyle = 'rgba(255,255,255,0.96)'; ctx.fillRect(eraseX - 18, 0, 36, canvas.height);
+                ctx.fillStyle = '#ef4444'; ctx.fillRect(eraseX - 4, 0, 8, canvas.height);
                 if (progress < 1) requestAnimationFrame(frame);
-                else {
-                    ctx.fillStyle = '#fff';
-                    ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    resolve();
-                }
+                else resolve();
             }
             requestAnimationFrame(frame);
         });
     }
 
-    // Reveals the picture in overlapping marker strokes that sweep back and forth over the board.
     function animateDrawing(img, duration) {
         return new Promise(resolve => {
             const mask = document.createElement('canvas');
-            mask.width = canvas.width;
-            mask.height = canvas.height;
+            mask.width = canvas.width; mask.height = canvas.height;
             const maskCtx = mask.getContext('2d');
             const spacing = 68;
             const rows = Math.ceil(canvas.height / spacing) + 1;
@@ -244,15 +197,10 @@
                 const progress = Math.min((now - start) / (duration * 1000), 1);
                 const distance = progress * totalLength;
                 maskCtx.clearRect(0, 0, mask.width, mask.height);
-                maskCtx.lineWidth = 92;
-                maskCtx.lineCap = 'round';
-                maskCtx.lineJoin = 'round';
+                maskCtx.lineWidth = 92; maskCtx.lineCap = 'round'; maskCtx.lineJoin = 'round';
                 maskCtx.strokeStyle = '#fff';
+                let remaining = distance, penX = 0, penY = 0, penAngle = 0;
 
-                let remaining = distance;
-                let penX = 0;
-                let penY = 0;
-                let penAngle = 0;
                 for (let row = 0; row < rows; row++) {
                     const y = row * spacing + spacing / 2;
                     const reverse = row % 2 === 1;
@@ -262,116 +210,117 @@
                     const covered = Math.max(0, Math.min(remaining, length));
                     if (covered > 0) {
                         const xEnd = x0 + (reverse ? -covered : covered);
-                        maskCtx.beginPath();
-                        maskCtx.moveTo(x0, y);
-                        maskCtx.lineTo(xEnd, y + Math.sin(covered / 55) * 2);
-                        maskCtx.stroke();
-                        penX = xEnd;
-                        penY = y;
-                        penAngle = reverse ? Math.PI : 0;
+                        maskCtx.beginPath(); maskCtx.moveTo(x0, y);
+                        maskCtx.lineTo(xEnd, y + Math.sin(covered / 55) * 2); maskCtx.stroke();
+                        penX = xEnd; penY = y; penAngle = reverse ? Math.PI : 0;
                     }
                     remaining -= length;
                 }
 
-                ctx.fillStyle = '#fff';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
                 ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                 ctx.globalCompositeOperation = 'destination-in';
                 ctx.drawImage(mask, 0, 0);
                 ctx.globalCompositeOperation = 'source-over';
 
-                if (progress < 1) {
-                    drawPenTip(penX, penY, penAngle);
-                    requestAnimationFrame(frame);
-                } else resolve();
+                if (progress < 1) { drawPenTip(penX, penY, penAngle); requestAnimationFrame(frame); }
+                else resolve();
             }
             requestAnimationFrame(frame);
         });
     }
 
+    // AGENT FIX: Parallel processing and strict state locks
     async function startAnimation() {
+        if (isProcessing) return;
         const text = document.getElementById('scriptInput').value.trim();
-        scenes = parseScript(text);
+        const scenes = parseScript(text);
         if (scenes.length === 0) return alert("Please enter a valid script.");
 
+        isProcessing = true;
         startBtn.disabled = true;
         let hasFailed = false;
+
         try {
             for (let i = 0; i < scenes.length; i++) {
                 const sentence = scenes[i];
-                status.innerText = `Generating scene ${i + 1} of ${scenes.length}...`;
-                try {
-                    const img = await fetchSketch(sentence);
-                    status.innerText = `Writing scene ${i + 1}...`;
-                    const wordCount = sentence.split(/\s+/).length;
-                    const speechDuration = Math.max(wordCount / 2.5, 3);
-                    const writingDuration = Math.max(sentence.length * 0.065, 2.8);
-                    await Promise.all([speak(sentence), drawHandwriting(sentence, writingDuration)]);
-                    status.innerText = `Erasing scene ${i + 1}...`;
-                    await eraseHandwriting(sentence);
-                    status.innerText = `Drawing scene ${i + 1}...`;
-                    await animateDrawing(img, speechDuration);
-                    await new Promise(resolve => setTimeout(resolve, 900));
-                } catch (error) {
-                    console.error(error);
+                status.innerText = `Preparing scene ${i + 1} of ${scenes.length}...`;
+                
+                // AGENT FIX: Start the image fetch IMMEDIATELY in the background
+                const imagePromise = fetchSketch(sentence).catch(e => {
+                    console.error(e);
                     hasFailed = true;
-                    status.innerText = `Error on scene ${i + 1}. Skipping...`;
+                    return null; // Resolve with null if it fails so the loop continues
+                });
+
+                // Calculate timings
+                const wordCount = sentence.split(/\s+/).length;
+                const speechDuration = Math.max(wordCount / 2.5, 3);
+                const writingDuration = Math.max(sentence.length * 0.065, 2.8);
+
+                // Run Speech and Handwriting simultaneously
+                status.innerText = `Writing scene ${i + 1}...`;
+                await Promise.all([speak(sentence), drawHandwriting(sentence, writingDuration)]);
+                
+                // Erase the text
+                status.innerText = `Erasing scene ${i + 1}...`;
+                await eraseHandwriting(sentence);
+                
+                // Now wait for the image to finish downloading (if it hasn't already)
+                status.innerText = `Drawing scene ${i + 1}...`;
+                const img = await imagePromise;
+                
+                if (img) {
+                    await animateDrawing(img, speechDuration);
+                } else {
+                    status.innerText = `Failed to draw scene ${i + 1}.`;
+                    await new Promise(r => setTimeout(r, 1500)); // Wait before next scene
                 }
+                
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
             status.innerText = hasFailed ? "Finished, but some scenes failed to load." : "Video Complete!";
         } finally {
+            isProcessing = false;
             startBtn.disabled = false;
         }
     }
 
     function toggleRecording() {
         if (isRecording) {
-            mediaRecorder.stop();
-            isRecording = false;
-            recordBtn.innerText = "Start Recording";
-            recordBtn.style.background = "#DC2626";
+            mediaRecorder.stop(); isRecording = false;
+            recordBtn.innerText = "Start Recording"; recordBtn.style.background = "#DC2626";
             status.innerText = "Finalizing recording...";
             return;
         }
-        if (!canvas.captureStream || !window.MediaRecorder) {
-            return alert("Canvas recording is not supported in this browser.");
-        }
-        const mimeType = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
-            .find(type => MediaRecorder.isTypeSupported(type));
-        if (!mimeType) return alert("This browser does not support WebM recording.");
+        if (!canvas.captureStream || !window.MediaRecorder) return alert("Recording not supported.");
+        
+        const mimeType = ["video/webm;codecs=vp9", "video/webm"].find(type => MediaRecorder.isTypeSupported(type));
+        if (!mimeType) return alert("WebM recording not supported.");
 
         recordedChunks = [];
         recordingStream = canvas.captureStream(30);
         mediaRecorder = new MediaRecorder(recordingStream, { mimeType, videoBitsPerSecond: 5_000_000 });
-        mediaRecorder.ondataavailable = event => {
-            if (event.data && event.data.size > 0) recordedChunks.push(event.data);
-        };
+        
+        mediaRecorder.ondataavailable = event => { if (event.data && event.data.size > 0) recordedChunks.push(event.data); };
         mediaRecorder.onstop = () => {
-            recordingStream.getTracks().forEach(track => track.stop());
-            recordingStream = null;
-            status.innerText = recordedChunks.length ? "Recording ready to download." : "Recording finished with no video data.";
+            recordingStream.getTracks().forEach(track => track.stop()); recordingStream = null;
+            status.innerText = recordedChunks.length ? "Recording ready to download." : "Recording failed.";
         };
-        mediaRecorder.onerror = event => {
-            console.error("Recording error", event);
-            status.innerText = "Recording failed.";
-        };
+        
         mediaRecorder.start(1000);
         isRecording = true;
-        recordBtn.innerText = "Stop Recording";
-        recordBtn.style.background = "#000";
+        recordBtn.innerText = "Stop Recording"; recordBtn.style.background = "#000";
         status.innerText = "Recording started. Click Generate.";
     }
 
     function downloadVideo() {
         if (recordedChunks.length === 0) return alert("No video recorded yet.");
-        const blob = new Blob(recordedChunks, { type: mediaRecorder?.mimeType || "video/webm" });
+        const blob = new Blob(recordedChunks, { type: "video/webm" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
-        link.href = url;
-        link.download = "mozkoli_whiteboard.webm";
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+        link.href = url; link.download = "mozkoli_whiteboard.webm";
+        document.body.appendChild(link); link.click(); link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 </script>
