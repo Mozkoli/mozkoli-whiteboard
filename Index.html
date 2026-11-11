@@ -36,12 +36,14 @@
     const ctx = canvas.getContext('2d');
     const status = document.getElementById('status');
     const startBtn = document.getElementById('startBtn');
+    const recordBtn = document.getElementById('recordBtn');
     const handwritingFont = 'italic 38px "Brush Script MT", "Segoe Script", cursive';
 
     let scenes = [];
     let isRecording = false;
     let mediaRecorder;
     let recordedChunks = [];
+    let recordingStream;
 
     function parseScript(text) {
         return text.match(/[^.!?]+(?:[.!?]+|$)/g)
@@ -62,201 +64,260 @@
     }
 
     function speak(text) {
-        return new Promise((resolve) => {
+        return new Promise(resolve => {
             window.speechSynthesis.cancel();
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.rate = 0.9;
-
-            const voices = window.speechSynthesis.getVoices();
-            const deepVoice = voices.find(v => v.name.includes('Male') || v.name.includes('UK'));
-            if (deepVoice) utterance.voice = deepVoice;
-
+            const voice = window.speechSynthesis.getVoices().find(v => /Male|UK/i.test(v.name));
+            if (voice) utterance.voice = voice;
             utterance.onend = resolve;
-            utterance.onerror = (e) => { console.warn("Speech error", e); resolve(); };
+            utterance.onerror = event => { console.warn("Speech error", event); resolve(); };
             window.speechSynthesis.speak(utterance);
         });
     }
 
-    // Lay out each character so the sentence can be drawn progressively and wrapped to the board.
     function layoutHandwriting(text) {
         ctx.font = handwritingFont;
-        const maxWidth = canvas.width - 100;
-        const lineHeight = 58;
-        const characters = [];
-        let x = 50;
-        let y = canvas.height / 2 - lineHeight / 2;
+        const left = 50;
+        const maxX = canvas.width - 50;
+        const lineHeight = 62;
+        const chars = [];
+        let x = left;
+        let y = canvas.height / 2;
+        let line = 0;
 
         for (const char of text) {
             if (char === '\n') {
-                x = 50;
+                x = left;
                 y += lineHeight;
-                characters.push({ char: '', x, y, width: 0 });
+                line++;
                 continue;
             }
-
             const width = ctx.measureText(char).width;
-            if (x + width > 50 + maxWidth && x > 50) {
-                x = 50;
+            if (x + width > maxX && x > left) {
+                x = left;
                 y += lineHeight;
+                line++;
             }
-            characters.push({ char, x, y, width });
-            x += width;
+            // Tiny per-letter variations help the fallback cursive font feel less mechanically placed.
+            const seed = chars.length;
+            chars.push({
+                char,
+                x,
+                y: y + Math.sin(seed * 1.7) * 1.4,
+                width,
+                rotation: Math.sin(seed * 2.3) * 0.025,
+                line
+            });
+            x += width + (char === ' ' ? 1 : Math.sin(seed * 2.1) * 0.55);
         }
 
-        // Keep multi-line sentences within the canvas while preserving their spacing.
-        const lineCount = Math.max(1, Math.floor((y - (canvas.height / 2 - lineHeight / 2)) / lineHeight) + 1);
-        const top = (canvas.height - lineCount * lineHeight) / 2 + lineHeight * 0.75;
-        const originalTop = canvas.height / 2 - lineHeight / 2;
-        characters.forEach(character => { character.y += top - originalTop; });
-        return characters;
+        const lineCount = line + 1;
+        const offset = (canvas.height - lineCount * lineHeight) / 2 + 25 - canvas.height / 2;
+        chars.forEach(item => { item.y += offset; });
+        return chars;
+    }
+
+    function drawGlyph(item, reveal = 1) {
+        if (!item.char || reveal <= 0) return;
+        ctx.save();
+        ctx.translate(item.x, item.y);
+        ctx.rotate(item.rotation);
+        ctx.beginPath();
+        ctx.rect(-2, -50, Math.max(0, item.width * reveal + 3), 60);
+        ctx.clip();
+        ctx.fillText(item.char, 0, 0);
+        ctx.restore();
+    }
+
+    function drawPenTip(x, y, angle = 0) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(angle);
+        ctx.fillStyle = '#e11d48';
+        ctx.beginPath();
+        ctx.moveTo(-5, -4);
+        ctx.lineTo(13, 0);
+        ctx.lineTo(-5, 4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = '#7f1d1d';
+        ctx.beginPath();
+        ctx.arc(11, 0, 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
     }
 
     function drawHandwriting(text, duration) {
         return new Promise(resolve => {
-            const characters = layoutHandwriting(text);
-            const startY = performance.now();
-            const totalDuration = duration * 1000;
+            const chars = layoutHandwriting(text);
+            const weights = chars.map(item => {
+                const punctuationPause = /[,;:]/.test(item.char) ? 2.2 : /[.!?]/.test(item.char) ? 3.8 : 1;
+                return (0.65 + Math.min(item.width / 22, 1.15)) * punctuationPause;
+            });
+            const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+            const start = performance.now();
+            let elapsedWeight = 0;
+            const intervals = weights.map(weight => {
+                const interval = [elapsedWeight / totalWeight, (elapsedWeight + weight) / totalWeight];
+                elapsedWeight += weight;
+                return interval;
+            });
 
-            function draw(now) {
-                const progress = Math.min((now - startY) / totalDuration, 1);
-                const visibleCount = Math.min(characters.length, Math.ceil(progress * characters.length));
+            function frame(now) {
+                const progress = Math.min((now - start) / (duration * 1000), 1);
                 ctx.fillStyle = '#fff';
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 ctx.font = handwritingFont;
                 ctx.textBaseline = 'alphabetic';
                 ctx.fillStyle = '#171717';
 
-                for (let i = 0; i < visibleCount; i++) {
-                    const character = characters[i];
-                    if (character.char) ctx.fillText(character.char, character.x, character.y);
-                }
+                let active = null;
+                let activeReveal = 0;
+                chars.forEach((item, index) => {
+                    const [from, to] = intervals[index];
+                    if (progress >= to) drawGlyph(item);
+                    else if (progress >= from) {
+                        active = item;
+                        activeReveal = Math.min((progress - from) / (to - from), 1);
+                        drawGlyph(item, activeReveal);
+                    }
+                });
 
-                if (progress < 1 && characters.length > 0) {
-                    const tip = characters[Math.min(visibleCount, characters.length - 1)];
-                    const penX = tip.x + (visibleCount > 0 && characters[visibleCount - 1].y === tip.y ? characters[visibleCount - 1].width : 0);
-                    const penY = tip.y - 5;
-                    ctx.beginPath();
-                    ctx.arc(penX, penY, 8, 0, Math.PI * 2);
-                    ctx.fillStyle = '#e11d48';
-                    ctx.fill();
-                    ctx.beginPath();
-                    ctx.arc(penX - 2, penY - 2, 2, 0, Math.PI * 2);
-                    ctx.fillStyle = '#fff';
-                    ctx.fill();
-                    requestAnimationFrame(draw);
-                } else {
-                    resolve();
-                }
+                if (active) drawPenTip(active.x + active.width * activeReveal, active.y - 7, active.rotation);
+                if (progress < 1) requestAnimationFrame(frame);
+                else resolve();
             }
-
-            requestAnimationFrame(draw);
+            requestAnimationFrame(frame);
         });
     }
 
-    function fadeHandwriting(text, duration = 700) {
+    // A broad moving eraser clears the written line, with a soft edge and a visible eraser block.
+    function eraseHandwriting(text, duration = 1100) {
         return new Promise(resolve => {
-            const characters = layoutHandwriting(text);
-            const startTime = performance.now();
+            const chars = layoutHandwriting(text);
+            const start = performance.now();
 
-            function draw(now) {
-                const progress = Math.min((now - startTime) / duration, 1);
+            function frame(now) {
+                const progress = Math.min((now - start) / duration, 1);
+                const eraseX = -40 + (canvas.width + 80) * progress;
                 ctx.fillStyle = '#fff';
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 ctx.font = handwritingFont;
                 ctx.textBaseline = 'alphabetic';
-                ctx.fillStyle = `rgba(23, 23, 23, ${1 - progress})`;
-                characters.forEach(character => {
-                    if (character.char) ctx.fillText(character.char, character.x, character.y);
-                });
+                ctx.fillStyle = '#171717';
+                chars.forEach(item => drawGlyph(item));
 
-                if (progress < 1) requestAnimationFrame(draw);
-                else resolve();
-            }
+                // Wipe only the portion already passed by the eraser.
+                ctx.clearRect(0, 0, Math.max(0, eraseX), canvas.height);
+                ctx.fillStyle = 'rgba(255,255,255,0.96)';
+                ctx.fillRect(eraseX - 18, 0, 36, canvas.height);
+                ctx.fillStyle = '#ef4444';
+                ctx.fillRect(eraseX - 4, 0, 8, canvas.height);
+                ctx.fillStyle = 'rgba(210,210,210,0.45)';
+                ctx.fillRect(eraseX + 5, 0, 3, canvas.height);
 
-            requestAnimationFrame(draw);
-        });
-    }
-
-    function animateDrawing(img, duration) {
-        return new Promise((resolve) => {
-            let startTime = null;
-            const drawSpeed = duration * 1000;
-            const maxRadius = 900;
-
-            function draw(now) {
-                if (!startTime) startTime = now;
-                const elapsed = now - startTime;
-                const progress = Math.min(elapsed / drawSpeed, 1);
-                const revealRadius = progress * maxRadius;
-
-                ctx.fillStyle = '#fff';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.save();
-                ctx.beginPath();
-                for (let angle = 0; angle < Math.PI * 2; angle += 0.1) {
-                    const radius = revealRadius + Math.sin(angle * 10) * 20;
-                    const x = canvas.width / 2 + Math.cos(angle) * radius;
-                    const y = canvas.height / 2 + Math.sin(angle) * radius;
-                    if (angle === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
-                }
-                ctx.closePath();
-                ctx.clip();
-                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-                if (progress < 1) {
-                    ctx.beginPath();
-                    ctx.arc(canvas.width / 2 + revealRadius, canvas.height / 2, 8, 0, Math.PI * 2);
-                    ctx.fillStyle = '#333';
-                    ctx.fill();
-                    ctx.restore();
-                    requestAnimationFrame(draw);
-                } else {
-                    ctx.restore();
+                if (progress < 1) requestAnimationFrame(frame);
+                else {
+                    ctx.fillStyle = '#fff';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
                     resolve();
                 }
             }
-            requestAnimationFrame(draw);
+            requestAnimationFrame(frame);
+        });
+    }
+
+    // Reveals the picture in overlapping marker strokes that sweep back and forth over the board.
+    function animateDrawing(img, duration) {
+        return new Promise(resolve => {
+            const mask = document.createElement('canvas');
+            mask.width = canvas.width;
+            mask.height = canvas.height;
+            const maskCtx = mask.getContext('2d');
+            const spacing = 68;
+            const rows = Math.ceil(canvas.height / spacing) + 1;
+            const start = performance.now();
+            const totalLength = rows * (canvas.width + 70);
+
+            function frame(now) {
+                const progress = Math.min((now - start) / (duration * 1000), 1);
+                const distance = progress * totalLength;
+                maskCtx.clearRect(0, 0, mask.width, mask.height);
+                maskCtx.lineWidth = 92;
+                maskCtx.lineCap = 'round';
+                maskCtx.lineJoin = 'round';
+                maskCtx.strokeStyle = '#fff';
+
+                let remaining = distance;
+                let penX = 0;
+                let penY = 0;
+                let penAngle = 0;
+                for (let row = 0; row < rows; row++) {
+                    const y = row * spacing + spacing / 2;
+                    const reverse = row % 2 === 1;
+                    const x0 = reverse ? canvas.width + 35 : -35;
+                    const x1 = reverse ? -35 : canvas.width + 35;
+                    const length = Math.abs(x1 - x0);
+                    const covered = Math.max(0, Math.min(remaining, length));
+                    if (covered > 0) {
+                        const xEnd = x0 + (reverse ? -covered : covered);
+                        maskCtx.beginPath();
+                        maskCtx.moveTo(x0, y);
+                        maskCtx.lineTo(xEnd, y + Math.sin(covered / 55) * 2);
+                        maskCtx.stroke();
+                        penX = xEnd;
+                        penY = y;
+                        penAngle = reverse ? Math.PI : 0;
+                    }
+                    remaining -= length;
+                }
+
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                ctx.globalCompositeOperation = 'destination-in';
+                ctx.drawImage(mask, 0, 0);
+                ctx.globalCompositeOperation = 'source-over';
+
+                if (progress < 1) {
+                    drawPenTip(penX, penY, penAngle);
+                    requestAnimationFrame(frame);
+                } else resolve();
+            }
+            requestAnimationFrame(frame);
         });
     }
 
     async function startAnimation() {
         const text = document.getElementById('scriptInput').value.trim();
         scenes = parseScript(text);
-
         if (scenes.length === 0) return alert("Please enter a valid script.");
 
         startBtn.disabled = true;
         let hasFailed = false;
-
         try {
             for (let i = 0; i < scenes.length; i++) {
                 const sentence = scenes[i];
                 status.innerText = `Generating scene ${i + 1} of ${scenes.length}...`;
-
                 try {
                     const img = await fetchSketch(sentence);
                     status.innerText = `Writing scene ${i + 1}...`;
                     const wordCount = sentence.split(/\s+/).length;
                     const speechDuration = Math.max(wordCount / 2.5, 3);
-                    const writingDuration = Math.max(sentence.length * 0.055, 2.5);
-
-                    await Promise.all([
-                        speak(sentence),
-                        drawHandwriting(sentence, writingDuration)
-                    ]);
-
+                    const writingDuration = Math.max(sentence.length * 0.065, 2.8);
+                    await Promise.all([speak(sentence), drawHandwriting(sentence, writingDuration)]);
+                    status.innerText = `Erasing scene ${i + 1}...`;
+                    await eraseHandwriting(sentence);
                     status.innerText = `Drawing scene ${i + 1}...`;
-                    await fadeHandwriting(sentence);
                     await animateDrawing(img, speechDuration);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                } catch (e) {
-                    console.error(e);
+                    await new Promise(resolve => setTimeout(resolve, 900));
+                } catch (error) {
+                    console.error(error);
                     hasFailed = true;
                     status.innerText = `Error on scene ${i + 1}. Skipping...`;
                 }
             }
-
             status.innerText = hasFailed ? "Finished, but some scenes failed to load." : "Video Complete!";
         } finally {
             startBtn.disabled = false;
@@ -267,44 +328,51 @@
         if (isRecording) {
             mediaRecorder.stop();
             isRecording = false;
-            document.getElementById('recordBtn').innerText = "Start Recording";
-            document.getElementById('recordBtn').style.background = "#DC2626";
+            recordBtn.innerText = "Start Recording";
+            recordBtn.style.background = "#DC2626";
+            status.innerText = "Finalizing recording...";
             return;
         }
-
         if (!canvas.captureStream || !window.MediaRecorder) {
             return alert("Canvas recording is not supported in this browser.");
         }
-
-        const mimeType = ["video/webm;codecs=vp9", "video/webm"]
+        const mimeType = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
             .find(type => MediaRecorder.isTypeSupported(type));
         if (!mimeType) return alert("This browser does not support WebM recording.");
 
         recordedChunks = [];
-        const stream = canvas.captureStream(30);
-        mediaRecorder = new MediaRecorder(stream, { mimeType });
-        mediaRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) recordedChunks.push(event.data);
+        recordingStream = canvas.captureStream(30);
+        mediaRecorder = new MediaRecorder(recordingStream, { mimeType, videoBitsPerSecond: 5_000_000 });
+        mediaRecorder.ondataavailable = event => {
+            if (event.data && event.data.size > 0) recordedChunks.push(event.data);
         };
-        mediaRecorder.start();
+        mediaRecorder.onstop = () => {
+            recordingStream.getTracks().forEach(track => track.stop());
+            recordingStream = null;
+            status.innerText = recordedChunks.length ? "Recording ready to download." : "Recording finished with no video data.";
+        };
+        mediaRecorder.onerror = event => {
+            console.error("Recording error", event);
+            status.innerText = "Recording failed.";
+        };
+        mediaRecorder.start(1000);
         isRecording = true;
-        document.getElementById('recordBtn').innerText = "Stop Recording";
-        document.getElementById('recordBtn').style.background = "#000";
+        recordBtn.innerText = "Stop Recording";
+        recordBtn.style.background = "#000";
         status.innerText = "Recording started. Click Generate.";
     }
 
     function downloadVideo() {
         if (recordedChunks.length === 0) return alert("No video recorded yet.");
-        const blob = new Blob(recordedChunks, { type: "video/webm" });
+        const blob = new Blob(recordedChunks, { type: mediaRecorder?.mimeType || "video/webm" });
         const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        document.body.appendChild(a);
-        a.style = "display: none";
-        a.href = url;
-        a.download = "mozkoli_whiteboard.webm";
-        a.click();
-        window.URL.revokeObjectURL(url);
-        a.remove();
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "mozkoli_whiteboard.webm";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 </script>
 </body>
